@@ -1,13 +1,13 @@
 #include <DueTimer.h>
 
-// firmware version (not ASCII)
+// numeric firmware version (not ASCII)
 const uint8_t VERSION = 3;
 
 // serial timeout
-# define TIMEOUT  1000
+# define TIMEOUT          500
 
 // DEBUG
-#define LED     13
+#define LED               13
 
 // sequence buffer
 #define SEQ_BUF_SIZE      16
@@ -20,8 +20,8 @@ const uint8_t VERSION = 3;
 
 union GalvoWaveform {
     struct {
-        uint16_t amplitude;
-        uint16_t offset;
+        uint16_t p0;
+        uint16_t p1;
         uint16_t dt;
     };
     uint16_t arr[3];
@@ -33,7 +33,7 @@ typedef struct {
 } Galvo;
 
 typedef struct {
-    uint8_t skip_n;
+    uint8_t activate : 1;
 
     uint8_t index;
     uint8_t len;
@@ -41,10 +41,14 @@ typedef struct {
     uint8_t patterns[SEQ_BUF_SIZE];
 } LaserSequence;
 
-typedef struct {   
+typedef struct {
+    uint8_t blanking : 1;
+    uint8_t blankOnHigh : 1;
+
     uint8_t pattern : 8;
     LaserSequence sequence;
 
+    uint8_t skip_n;
     int32_t counter;
 } Laser;
 
@@ -59,28 +63,20 @@ typedef struct {
 } Camera;
 
 enum State {
-    READY = 1,
+    RESET = 1,
 
-    TRIGGER_MODE__START,
-    TRIGGER_MODE__WAITING,
-    TRIGGER_MODE__EXPOSURE_START,
-    TRIGGER_MODE__EXPOSING,
-    TRIGGER_MODE__EXPOSURE_STOP,
-    TRIGGER_MODE__STOP,
+    WAIT_TRIGGER,
 
-    BLANKING_MODE__WAITING,
-    BLANKING_MODE__ACTIVE,
-    BLANKING_MODE__INACTIVE,
-    BLANKING_MODE__STOP
+    EXPOSURE__STARTED,
+    EXPOSURE__IN_PROGRESS,
+    EXPOSURE__STOPPED
 };
 
 typedef struct {
     int state;
-    uint8_t blankOnHigh : 1;
 
     Galvo x_galvo;
     Laser laser;
-
     Camera camera;
 } States;
 
@@ -98,26 +94,28 @@ void init_laser() {
 
 void set_laser_pattern() {
     PIOD->PIO_ODSR = states.laser.pattern;
+    digitalWrite(LED, HIGH);
 }
 
 void clear_laser_pattern() {
     PIOD->PIO_CODR = 0xFF;
+    digitalWrite(LED, LOW);
 }
 
-bool waitForSerial(unsigned long timeOut) {
-    unsigned long startTime = millis();
-    while (Serial.available() == 0 && (millis() - startTime < timeOut) ) {}
-    if (Serial.available() > 0)
-        return true;
+bool waitForSerial(unsigned long timeout) {
+    unsigned long t0 = millis();
+    do {
+        if (Serial.available() > 0) {
+            return true;
+        }
+    } while (millis() - t0 < timeout);
     return false;
 }
 
 void camera_event() {
-    if (digitalRead(CAMERA_FIRE_ALL)) {
-        digitalWrite(LED, HIGH);
+    if ((digitalRead(CAMERA_FIRE_ALL) ^ states.laser.blankOnHigh) & 0x01) {
         states.camera.event = EXPOSURE_STARTED;
     } else {
-        digitalWrite(LED, LOW);
         states.camera.event = EXPOSURE_FINISHED;
     }
 }
@@ -127,7 +125,7 @@ void updateXGalvo() {
 
     // prevent overflow
     uint32_t next_value = (uint32_t)states.x_galvo.value + (uint32_t)states.x_galvo.waveform.dt;
-    uint32_t max_value = (uint32_t)states.x_galvo.waveform.offset + (uint32_t)states.x_galvo.waveform.amplitude;
+    uint32_t max_value = (uint32_t)states.x_galvo.waveform.p0 + (uint32_t)states.x_galvo.waveform.p1;
     if (next_value >= max_value) {
         next_value = max_value;
     }
@@ -137,31 +135,35 @@ void updateXGalvo() {
 void setup() {
     Serial.begin(57600);
 
-    init_laser();
-    clear_laser_pattern();
-    
-    // camera trigger
-    pinMode(CAMERA_FIRE_ALL, INPUT_PULLUP);
+    //DEBUG
+    pinMode(LED, OUTPUT);
+    digitalWrite(LED, LOW);
 
     // galvo DAC control
     analogWriteResolution(12);
     // 100us update rate
     Timer2.attachInterrupt(updateXGalvo).setPeriod(100);
 
-    pinMode(LED, OUTPUT);
-    digitalWrite(LED, LOW);
+    // laser
+    init_laser();
+    clear_laser_pattern();
+
+    // camera trigger
+    pinMode(CAMERA_FIRE_ALL, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(CAMERA_FIRE_ALL), camera_event, CHANGE);
+    states.camera.event = NONE;
 
     // init state
-    states.state = READY;
+    states.state = RESET;
 }
 
 void loop() {
     if (Serial.available() > 0) {
         switch (Serial.read()) {
             /*  Set digital output command: 1p
-                Where p is the desired digital pattern.
+                  Where p is the desired digital pattern.
 
-                Returns 1 to indicate succesfull execution.
+                  Returns 1 to indicate succesfull execution.
             */
             case 1:
                 if (waitForSerial(TIMEOUT)) {
@@ -170,16 +172,12 @@ void loop() {
                     break;
                 }
 
-                if (states.state == READY) {
-                    set_laser_pattern();
-                }
-
                 Serial.write(1);
                 break;
 
             /*  Get Digital output command: 2
 
-                Returns 2p. Where p is the current digital output pattern
+                  Returns 2p. Where p is the current digital output pattern
             */
             case 2:
                 Serial.write(2);
@@ -187,7 +185,7 @@ void loop() {
                 break;
 
             /*  X galvo control command 3xvv
-                  Where x is the register (0: amplitude, 1: offset) and vv is the output in
+                  Where x is the register (0: start, 1: end, 2: step) and vv is the output in
                   a 12-bit significant number.
 
                   Returns 3xvv
@@ -219,8 +217,8 @@ void loop() {
                     }
 
                     states.x_galvo.waveform.arr[channel] = value;
-                    if (channel == 1) {
-                        // update offset immediately, neutral position
+                    if (channel == 0) {
+                        // update immediately, neutral position
                         states.x_galvo.value = value;
                         analogWrite(X_GALVO_DAC, value);
                     }
@@ -295,92 +293,87 @@ void loop() {
                   Returns 7x
             */
             case 7:
-                {
-                    uint8_t skip_n;
-                    if (waitForSerial(TIMEOUT)) {
-                        skip_n = Serial.read();
-                    } else {
-                        break;
-                    }
-
-                    states.laser.sequence.skip_n = skip_n;
-
-                    Serial.write(7);
-                    Serial.write(skip_n);
+                if (waitForSerial(TIMEOUT)) {
+                    states.laser.skip_n = Serial.read();
+                } else {
                     break;
                 }
 
-            /*  Start trigger mode: 8
-                  Trigger mode will supersede blanking mode.
+                Serial.write(7);
+                Serial.write(states.laser.skip_n);
+                break;
+
+            /*  Start sequence mode: 8
 
                   Returns 8 to indicate start of trigger mode
             */
             case 8:
-                if (states.laser.sequence.len <= 0) {
-                    break;
-                }
+                // reset index
                 states.laser.sequence.index = 0;
-                states.laser.counter = -states.laser.sequence.skip_n;
+                // reset acquisition count
+                states.laser.counter = -states.laser.skip_n;
 
-                states.state = TRIGGER_MODE__START;
+                states.laser.sequence.activate = true;
 
                 Serial.write(8);
                 break;
 
-            /*  Stop Trigger mode: 9
+            /*  Stop sequence mode: 9
                   Returns 9x where x is the number of triggers received during the last
                   trigger mode run
             */
             case 9:
-                states.state = TRIGGER_MODE__STOP;
+                states.laser.sequence.activate = false;
 
                 Serial.write(9);
                 Serial.write(states.laser.counter);
                 break;
 
             /*  Start blanking mode: 20
-                 In blanking mode, zeroes will be written on the output pins when the trigger pin
-                 is low, when the trigger pin is high, the pattern set with command 1 will be
-                 applied to the output pins.
+                  In blanking mode, zeroes will be written on the output pins when the trigger pin
+                  is low, when the trigger pin is high, the pattern set with command 1 will be
+                  applied to the output pins.
 
-                 Returns 20
+                  Returns 20
             */
             case 20:
-                states.state = BLANKING_MODE__WAITING;
+                states.laser.blanking = true;
+
                 Serial.write(20);
                 break;
 
             /*  Stop blanking mode: 21
-                 Stopts blanking mode
+                  Stopts blanking mode
 
-                 Returns 21
+                  Returns 21
             */
             case 21:
-                states.state = BLANKING_MODE__STOP;
+                states.laser.blanking = false;
+
                 Serial.write(21);
                 break;
 
-            /*  Set blanking mode polarity: 22
-                 Sets 'polarity' of input TTL for blanking mode. 0 for positive level.
+            /*  Set trigger polarity: 22
+                  0 for negative TTL (disable output, aka, blanking, when TTL is high).
 
-                 Returns 22 to indicate succesfull execution.
+                  Returns 22 to indicate succesfull execution.
             */
             case 22:
                 if (waitForSerial(TIMEOUT)) {
-                    states.blankOnHigh = (Serial.read() == 0);
+                    states.laser.blankOnHigh = (Serial.read() == 0);
                     Serial.write(22);
                 } break;
 
 
             /*  Get Identifcatio: 30
-                 Returns in ASCI MM-Ard\r\n
+                  Returns in ASCI "MM-Ard\r\n"
             */
             case 30:
                 Serial.println("MM-Ard");
                 break;
 
             /*  Get Version: 31
-                 Returns: version number in ASCI \r\n
+                  Returns: {numeric version number}"\r\n"
             */
             case 31:
                 Serial.println(VERSION);
@@ -389,99 +382,64 @@ void loop() {
     }
 
     switch (states.state) {
-        case READY:
+        case RESET:
+            // reset galvo
+            states.x_galvo.value = states.x_galvo.waveform.p0;
+
+            states.state = WAIT_TRIGGER;
             break;
 
-        /*
-            Trigger mode
-        */
-        case TRIGGER_MODE__START:
-            states.camera.event = NONE;
-            attachInterrupt(digitalPinToInterrupt(CAMERA_FIRE_ALL), camera_event, CHANGE);
-            states.state = TRIGGER_MODE__WAITING;
-            break;
-
-        case TRIGGER_MODE__WAITING:
+        case WAIT_TRIGGER:
             if (states.camera.event == EXPOSURE_STARTED) {
                 states.camera.event = NONE;
-                states.state = TRIGGER_MODE__EXPOSURE_START;
+                states.state = EXPOSURE__STARTED;
             }
             break;
 
-        case TRIGGER_MODE__EXPOSURE_START:
+        case EXPOSURE__STARTED:
             // skip first N triggers
             if (states.laser.counter < 0) {
                 ++states.laser.counter;
 
-                states.state = TRIGGER_MODE__WAITING;
+                states.state = WAIT_TRIGGER;
                 break;
             }
 
             // set pattern
             set_laser_pattern();
-            // update next pattern
-            ++states.laser.sequence.index;
-            if (states.laser.sequence.index >= states.laser.sequence.len) {
-                states.laser.sequence.index = 0;
-            }
-            states.laser.pattern = states.laser.sequence.patterns[states.laser.sequence.index];
 
-            // reset galvo
-            states.x_galvo.value = states.x_galvo.waveform.offset;
             // fire galvo
             Timer2.start();
 
-            states.state = TRIGGER_MODE__EXPOSING;
+            states.state = EXPOSURE__IN_PROGRESS;
             break;
 
-        case TRIGGER_MODE__EXPOSING:
+        case EXPOSURE__IN_PROGRESS:
             if (states.camera.event == EXPOSURE_FINISHED) {
                 states.camera.event = NONE;
-                states.state = TRIGGER_MODE__EXPOSURE_STOP;
+                states.state = EXPOSURE__STOPPED;
             }
             break;
 
-        case TRIGGER_MODE__EXPOSURE_STOP:
+        case EXPOSURE__STOPPED:
             // stop timer
             Timer2.stop();
+
             // stop output
-            clear_laser_pattern();
-            // reset galvo
-            states.x_galvo.value = states.x_galvo.waveform.offset;
-
-            states.state = TRIGGER_MODE__WAITING;
-            break;
-
-        case TRIGGER_MODE__STOP:
-            detachInterrupt(digitalPinToInterrupt(CAMERA_FIRE_ALL));
-            states.state = READY;
-            break;
-
-        /*
-            Blanking mode
-        */
-        case BLANKING_MODE__WAITING:
-            if ((digitalRead(CAMERA_FIRE_ALL) ^ states.blankOnHigh) & 0x01) {
-                states.state = BLANKING_MODE__INACTIVE;
-            } else {
-                states.state = BLANKING_MODE__ACTIVE;              
+            if (states.laser.blanking) {
+                clear_laser_pattern();
             }
-            break;
+            // update pattern if sequence mode is activated
+            if (states.laser.sequence.activate) {
+                // update next pattern
+                ++states.laser.sequence.index;
+                if (states.laser.sequence.index >= states.laser.sequence.len) {
+                    states.laser.sequence.index = 0;
+                }
+                states.laser.pattern = states.laser.sequence.patterns[states.laser.sequence.index];
+            }
 
-        case BLANKING_MODE__ACTIVE:
-            // disable output when active (blank the output)
-            clear_laser_pattern();
-            states.state = BLANKING_MODE__WAITING;
-            break;
-
-        case BLANKING_MODE__INACTIVE:
-            set_laser_pattern();
-            states.state = BLANKING_MODE__WAITING;
-            break;
-
-        case BLANKING_MODE__STOP:
-            set_laser_pattern();
-            states.state = READY;
+            states.state = RESET;
             break;
     }
 }
