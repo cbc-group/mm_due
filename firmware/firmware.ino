@@ -6,9 +6,6 @@ const uint8_t VERSION = 3;
 // serial timeout
 # define TIMEOUT          500
 
-// DEBUG
-#define LED               13
-
 // sequence buffer
 #define SEQ_BUF_SIZE      16
 
@@ -45,7 +42,7 @@ typedef struct {
     uint8_t blanking : 1;
     uint8_t blankOnHigh : 1;
 
-    uint8_t pattern : 8;
+    uint8_t pattern;
     LaserSequence sequence;
 
     uint8_t skip_n;
@@ -94,12 +91,10 @@ void init_laser() {
 
 void set_laser_pattern() {
     PIOD->PIO_ODSR = states.laser.pattern;
-    digitalWrite(LED, HIGH);
 }
 
 void clear_laser_pattern() {
     PIOD->PIO_CODR = 0xFF;
-    digitalWrite(LED, LOW);
 }
 
 bool waitForSerial(unsigned long timeout) {
@@ -134,10 +129,6 @@ void updateXGalvo() {
 
 void setup() {
     Serial.begin(57600);
-
-    //DEBUG
-    pinMode(LED, OUTPUT);
-    digitalWrite(LED, LOW);
 
     // galvo DAC control
     analogWriteResolution(12);
@@ -231,7 +222,7 @@ void loop() {
                 }
 
             /*  Set digital pattern for triggerd mode: 5xd
-                  Where x is the number of the pattern (currrently, 12 patterns can be stored).
+                  Where x is the number of the pattern (currrently, 16 patterns can be stored).
                   and d is the digital pattern to be stored at that position. Note that x should be
                   real number (i.e., not ASCI encoded)
 
@@ -271,20 +262,15 @@ void loop() {
                 Returns 6x
             */
             case 6:
-                {
-                    uint8_t len;
-                    if (waitForSerial(TIMEOUT)) {
-                        len = Serial.read();
-                    } else {
-                        break;
-                    }
-
-                    states.laser.sequence.len = len;
-
-                    Serial.write(6);
-                    Serial.write(len);
+                if (waitForSerial(TIMEOUT)) {
+                    states.laser.sequence.len = Serial.read();
+                } else {
                     break;
                 }
+
+                Serial.write(6);
+                Serial.write(states.laser.sequence.len);
+                break;
 
             /*  Skip tirgger: 7x
                   Where x indicates how many digital change events on the trigger input pin
@@ -361,8 +347,12 @@ void loop() {
             case 22:
                 if (waitForSerial(TIMEOUT)) {
                     states.laser.blankOnHigh = (Serial.read() == 0);
-                    Serial.write(22);
-                } break;
+                } else {
+                    break;
+                }
+
+                Serial.write(22);
+                break;
 
 
             /*  Get Identifcatio: 30
