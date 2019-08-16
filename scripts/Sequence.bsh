@@ -1,0 +1,10 @@
+import mmcorej.StrVector;
+
+x = new StrVector();
+x.add("1");
+x.add("2");
+
+mmc.loadPropertySequence("Arduino32-Switch", "State", x);
+mmc.startPropertySequence("Arduino32-Switch", "State");
+
+gui.message("Done");
