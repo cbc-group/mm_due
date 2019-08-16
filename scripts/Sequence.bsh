@@ -1,10 +1,16 @@
 import mmcorej.StrVector;
 
-x = new StrVector();
-x.add("1");
-x.add("2");
+channels = new StrVector();
 
-mmc.loadPropertySequence("Arduino32-Switch", "State", x);
-mmc.startPropertySequence("Arduino32-Switch", "State");
+// switch device
+device = "Lasers";
+
+// channel order
+channels.add("1");
+channels.add("2");
+
+// apply sequence
+mmc.loadPropertySequence(device, "State", channels);
+mmc.startPropertySequence(device, "State");
 
 gui.message("Done");
